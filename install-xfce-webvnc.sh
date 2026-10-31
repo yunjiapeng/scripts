@@ -3,15 +3,20 @@
 # Supported container guests: Debian 13 (trixie) and Ubuntu 24.04 (noble).
 set -Eeuo pipefail
 export LC_ALL=C
-DESKTOP_USER=webdesktop
-DESKTOP_HOME=/home/webdesktop
+DESKTOP_USER=root
+DESKTOP_HOME=/root
 VNC_UNIT=/etc/systemd/system/xfce-vnc.service
 WEB_UNIT=/etc/systemd/system/xfce-webvnc.service
 PRIVILEGE_DROPIN=/etc/systemd/system/xfce-vnc.service.d/zzzz-webdesktop-privileges.conf
 SUDOERS_FILE=/etc/sudoers.d/90-xfce-webdesktop
+CHROME_WRAPPER=/usr/local/bin/chrome-vnc
+CHROME_MENU=/root/.local/share/applications/google-chrome.desktop
+CHROME_DESKTOP=/root/Desktop/google-chrome.desktop
 MARKER='# Managed by install-xfce-webvnc'
 MODE=install
 PACKAGE_DIR=''
+REPAIR_PASSWORD_SOURCE=''
+MANAGED_FILES=("$WEB_UNIT" "$VNC_UNIT" "$PRIVILEGE_DROPIN" "$SUDOERS_FILE" "$CHROME_WRAPPER" "$CHROME_MENU" "$CHROME_DESKTOP")
 
 cleanup() {
     if [[ -n $PACKAGE_DIR ]]; then
@@ -27,13 +32,13 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 trap 'echo "Failed at line $LINENO. Check the error above; service logs: journalctl -u xfce-vnc -u xfce-webvnc -n 80 --no-pager" >&2' ERR
 
 if [[ ${1:-} == --uninstall ]]; then
-    for unit in "$WEB_UNIT" "$VNC_UNIT" "$PRIVILEGE_DROPIN" "$SUDOERS_FILE"; do
+    for unit in "${MANAGED_FILES[@]}"; do
         [[ ! -e $unit ]] || grep -qF "$MARKER" "$unit" || die "Unmanaged file: $unit"
     done
     systemctl disable --now xfce-webvnc.service xfce-vnc.service 2>/dev/null || true
-    rm -f "$WEB_UNIT" "$VNC_UNIT" "$PRIVILEGE_DROPIN" "$SUDOERS_FILE"
+    rm -f "${MANAGED_FILES[@]}"
     systemctl daemon-reload
-    echo 'Services and managed passwordless sudo permission removed. Packages, account and user files are retained.'
+    echo 'Services, managed Chrome launchers and old managed sudo permission removed. Packages and desktop files are retained.'
     exit 0
 fi
 if [[ $# == 1 && $1 == --repair ]]; then
@@ -48,13 +53,18 @@ case "${ID:-}:${VERSION_ID:-}" in
     *) die "Supported container systems: Debian 13 and Ubuntu 24.04. Detected: ${PRETTY_NAME:-unknown} (ID=${ID:-unknown}, VERSION_ID=${VERSION_ID:-unknown})." ;;
 esac
 [[ $(dpkg --print-architecture) == amd64 ]] || die 'Official Google Chrome for Linux requires an amd64 container.'
-[[ $(awk '$1 == "NoNewPrivs:" {print $2}' /proc/1/status) == 0 ]] || die 'Container PID 1 has NoNewPrivs=1. This cannot be cleared inside the container. On A, inspect this container LXC configuration (including lxc.no_new_privs), disable the inherited flag and stop/start the container, then rerun.'
-for unit in "$VNC_UNIT" "$WEB_UNIT" "$PRIVILEGE_DROPIN" "$SUDOERS_FILE"; do
+for unit in "${MANAGED_FILES[@]}"; do
     [[ ! -e $unit ]] || grep -qF "$MARKER" "$unit" || die "Will not overwrite existing file: $unit"
 done
 if [[ $MODE == repair ]]; then
-    [[ -f $VNC_UNIT && -f $WEB_UNIT && -s $DESKTOP_HOME/.vnc/passwd ]] || die '--repair requires an existing managed installation and VNC password.'
-    id "$DESKTOP_USER" >/dev/null 2>&1 || die 'Desktop account is missing.'
+    [[ -f $VNC_UNIT && -f $WEB_UNIT ]] || die '--repair requires an existing managed installation. Use no arguments for a new installation.'
+    for password_file in /root/.vnc/passwd /root/.config/tigervnc/passwd /home/webdesktop/.vnc/passwd /home/webdesktop/.config/tigervnc/passwd; do
+        if [[ -s $password_file ]]; then
+            REPAIR_PASSWORD_SOURCE=$password_file
+            break
+        fi
+    done
+    [[ -n $REPAIR_PASSWORD_SOURCE ]] || die 'No existing VNC password found. Run without --repair to set a new password.'
 fi
 
 if [[ $MODE != repair && -z ${VNC_PASSWORD:-} ]]; then
@@ -73,12 +83,12 @@ fi
 # Keep the password out of package-manager subprocess environments.
 export -n VNC_PASSWORD
 
-echo '[1/5] Installing XFCE, TigerVNC, noVNC and administration tools...'
+echo '[1/5] Installing XFCE, TigerVNC and noVNC...'
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     xfce4 xfce4-terminal dbus-x11 dbus-user-session \
     tigervnc-standalone-server tigervnc-common tigervnc-tools novnc websockify \
-    fonts-dejavu-core fonts-wqy-microhei iproute2 sudo curl ca-certificates
+    fonts-dejavu-core fonts-wqy-microhei iproute2 curl ca-certificates
 [[ -x /usr/bin/tigervncserver && -x /usr/bin/tigervncpasswd && -x /usr/bin/websockify ]] || die 'Required program missing after installation.'
 [[ -r /usr/share/novnc/vnc.html ]] || die 'noVNC web files are missing.'
 
@@ -106,14 +116,8 @@ if [[ ! -e $WEB_UNIT ]]; then
     [[ -z $(ss -H -ltn 'sport = :6080') ]] || die 'TCP 6080 is already in use.'
 fi
 
-echo '[3/5] Preparing the desktop account and sudo permission...'
-if id "$DESKTOP_USER" >/dev/null 2>&1; then
-    [[ $(getent passwd "$DESKTOP_USER" | cut -d: -f6) == "$DESKTOP_HOME" ]] || die 'Existing webdesktop account has an unexpected home directory.'
-else
-    useradd --create-home --home-dir "$DESKTOP_HOME" --shell /bin/bash "$DESKTOP_USER"
-fi
+echo '[3/5] Preparing the root desktop and migrating the VNC password...'
 [[ -d $DESKTOP_HOME ]] || die 'Desktop home directory is missing.'
-[[ $(id -u "$DESKTOP_USER") != 0 ]] || die 'Desktop account must not be root.'
 # Stop only services managed by this installer before updating their configuration.
 if [[ -e $WEB_UNIT ]]; then systemctl stop xfce-webvnc.service; fi
 if [[ -e $VNC_UNIT ]]; then systemctl stop xfce-vnc.service; fi
@@ -128,6 +132,8 @@ fi
 install -d -m 700 -o "$DESKTOP_USER" -g "$(id -gn "$DESKTOP_USER")" "$DESKTOP_HOME/.vnc"
 if [[ $MODE != repair ]]; then
     (umask 077; printf '%s\n' "$VNC_PASSWORD" | /usr/bin/tigervncpasswd -f > "$DESKTOP_HOME/.vnc/passwd")
+elif [[ ! $REPAIR_PASSWORD_SOURCE -ef $DESKTOP_HOME/.vnc/passwd ]]; then
+    install -m 600 -o root -g root "$REPAIR_PASSWORD_SOURCE" "$DESKTOP_HOME/.vnc/passwd"
 fi
 unset VNC_PASSWORD
 cat > "$DESKTOP_HOME/.vnc/xstartup" <<'EOF'
@@ -140,20 +146,36 @@ chown "$DESKTOP_USER:$(id -gn "$DESKTOP_USER")" "$DESKTOP_HOME/.vnc/passwd" "$DE
 chmod 600 "$DESKTOP_HOME/.vnc/passwd"
 chmod 700 "$DESKTOP_HOME/.vnc/xstartup"
 
-# This desktop is administered by its owner: permit sudo without an additional
-# Linux password. The VNC password remains independent from the Linux account.
-install -d -m 755 /etc/sudoers.d
-sudoers_tmp=$(mktemp /etc/sudoers.d/.xfce-webdesktop.XXXXXX)
-printf '%s\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$MARKER" "$DESKTOP_USER" > "$sudoers_tmp"
-chmod 440 "$sudoers_tmp"
-visudo -cf "$sudoers_tmp"
-mv -f "$sudoers_tmp" "$SUDOERS_FILE"
+# The desktop now starts as UID 0 and does not elevate through sudo. Retire only
+# the privilege overrides written by earlier versions; keep the old user's files.
+rm -f "$PRIVILEGE_DROPIN" "$SUDOERS_FILE"
 
-install -d -m 755 -o "$DESKTOP_USER" -g "$(id -gn "$DESKTOP_USER")" "$DESKTOP_HOME/Desktop"
-install -m 755 -o "$DESKTOP_USER" -g "$(id -gn "$DESKTOP_USER")" \
-    /usr/share/applications/google-chrome.desktop "$DESKTOP_HOME/Desktop/google-chrome.desktop"
+# Chrome refuses to run as root with its regular sandbox. This launcher is
+# specifically for the user-requested root desktop; it disables Chrome's sandbox.
+install -d -m 755 /usr/local/bin "$DESKTOP_HOME/Desktop" "$DESKTOP_HOME/.local/share/applications"
+cat > "$CHROME_WRAPPER" <<EOF
+#!/bin/sh
+$MARKER
+exec /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --user-data-dir=/root/.config/google-chrome-vnc "\$@"
+EOF
+chmod 755 "$CHROME_WRAPPER"
+cat > "$CHROME_MENU" <<EOF
+$MARKER
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Chrome
+Comment=Chrome for the root VNC desktop (sandbox disabled)
+Exec=$CHROME_WRAPPER %U
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true
+StartupWMClass=Google-chrome
+EOF
+install -m 755 -o root -g root "$CHROME_MENU" "$CHROME_DESKTOP"
 
-echo '[4/5] Installing boot services and desktop privilege override...'
+echo '[4/5] Installing root desktop boot services...'
 cat > "$VNC_UNIT" <<EOF
 $MARKER
 [Unit]
@@ -169,7 +191,6 @@ Environment=LANG=C.UTF-8
 Environment=XDG_RUNTIME_DIR=/run/xfce-vnc
 RuntimeDirectory=xfce-vnc
 RuntimeDirectoryMode=0700
-ExecStartPre=/usr/bin/sudo -n /usr/bin/true
 ExecStart=/usr/bin/tigervncserver :1 -fg -localhost yes -geometry 1600x900 -depth 24 -SecurityTypes VncAuth -PasswordFile $DESKTOP_HOME/.vnc/passwd -xstartup $DESKTOP_HOME/.vnc/xstartup
 ExecStop=-/usr/bin/tigervncserver -kill :1
 Restart=on-failure
@@ -180,16 +201,6 @@ TimeoutStopSec=15
 WantedBy=multi-user.target
 EOF
 
-# A generic /run/systemd/system/service.d/zzz-lxc-service.conf can set
-# NoNewPrivileges for every service. A unit-specific, later-sorting drop-in
-# overrides it for this desktop only, without modifying the generated LXC file.
-install -d -m 755 "$(dirname "$PRIVILEGE_DROPIN")"
-cat > "$PRIVILEGE_DROPIN" <<EOF
-$MARKER
-[Service]
-NoNewPrivileges=no
-RestrictSUIDSGID=no
-EOF
 cat > "$WEB_UNIT" <<EOF
 $MARKER
 [Unit]
@@ -210,9 +221,8 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-echo '[5/5] Starting services and checking desktop privileges...'
+echo '[5/5] Starting services and checking the root desktop...'
 systemctl daemon-reload
-[[ $(systemctl show xfce-vnc.service -p NoNewPrivileges --value) == no ]] || die 'Another systemd setting still enables NoNewPrivileges. Inspect: systemctl cat xfce-vnc.service'
 systemctl enable --now xfce-vnc.service xfce-webvnc.service
 ready=0
 stable_checks=0
@@ -236,7 +246,8 @@ if [[ $ready != 1 ]]; then
 fi
 desktop_pid=$(systemctl show xfce-vnc.service -p MainPID --value)
 [[ $desktop_pid =~ ^[1-9][0-9]*$ && -r /proc/$desktop_pid/status ]] || die 'Cannot inspect desktop process privileges.'
-[[ $(awk '$1 == "NoNewPrivs:" {print $2}' "/proc/$desktop_pid/status") == 0 ]] || die 'Desktop still inherits NoNewPrivs=1. Inspect systemd drop-ins and the container parent configuration.'
+[[ $(awk '$1 == "Uid:" {print $2, $3}' "/proc/$desktop_pid/status") == '0 0' ]] || die 'Desktop process is not running with real/effective UID 0.'
+desktop_nnp=$(awk '$1 == "NoNewPrivs:" {print $2}' "/proc/$desktop_pid/status")
 python3 - <<'PY'
 import socket
 with socket.create_connection(('127.0.0.1', 5901), timeout=3) as connection:
@@ -249,7 +260,9 @@ echo
 echo 'Ready: http://CONTAINER_IP:6080/vnc.html?autoconnect=1&resize=remote'
 echo 'Browser login uses the VNC password set above; no Linux username is needed.'
 echo 'For external access, map an A host TCP port to this container TCP 6080.'
-echo 'Desktop NoNewPrivs=0; webdesktop has passwordless sudo. Chrome is available in the applications menu and on the desktop.'
+echo "Desktop runs as root (UID 0). NoNewPrivs=$desktop_nnp does not require sudo elevation."
+echo 'Chrome is available in the applications menu and on the desktop, or run: chrome-vnc'
+echo 'The root Chrome launcher uses --no-sandbox; Chrome sandbox protection is disabled.'
 echo 'Reconnect noVNC to use the restarted desktop session.'
 echo 'Container IPv4 addresses:'
 ip -4 -o addr show scope global
