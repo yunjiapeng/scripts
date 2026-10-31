@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Install a minimal XFCE desktop with TigerVNC + noVNC inside a systemd LXC.
+# Supported container guests: Debian 13 (trixie) and Ubuntu 24.04 (noble).
 set -Eeuo pipefail
 export LC_ALL=C
 DESKTOP_USER=webdesktop
@@ -26,9 +27,9 @@ fi
 [[ $# == 0 ]] || die 'Usage: bash install-xfce-webvnc.sh [--uninstall]'
 
 source /etc/os-release
-case "$ID:$VERSION_ID" in
-    debian:12|ubuntu:24.04) ;;
-    *) die 'Supported systems: Debian 12 and Ubuntu 24.04.' ;;
+case "${ID:-}:${VERSION_ID:-}" in
+    debian:13|ubuntu:24.04) ;;
+    *) die "Supported container systems: Debian 13 and Ubuntu 24.04. Detected: ${PRETTY_NAME:-unknown} (ID=${ID:-unknown}, VERSION_ID=${VERSION_ID:-unknown})." ;;
 esac
 for unit in "$VNC_UNIT" "$WEB_UNIT"; do
     [[ ! -e $unit ]] || grep -qF "$MARKER" "$unit" || die "Will not overwrite existing file: $unit"
